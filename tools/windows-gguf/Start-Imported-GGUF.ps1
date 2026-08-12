@@ -16,7 +16,10 @@ foreach ($listener in @(Get-NetTCPConnection -LocalPort 8080 -State Listen -Erro
     elseif ($process) { throw "Port 8080 is used by $($process.ProcessName), PID $($process.Id)." }
 }
 
-$arguments = @('-m', [string]$model.path, '--alias', [string]$model.alias,
+# Windows PowerShell 5.1 joins ArgumentList entries into one command-line string.
+# Quote the model path explicitly so spaces are preserved when llama-server parses it.
+$quotedModelPath = '"' + [string]$model.path + '"'
+$arguments = @('-m', $quotedModelPath, '--alias', [string]$model.alias,
     '--host', '127.0.0.1', '--port', '8080', '-ngl', [string]$model.gpu_layers,
     '-c', [string]$model.context_size, '--jinja', '--reasoning', 'off')
 $stdout = Join-Path $support "logs\$Alias.out.log"
@@ -33,4 +36,3 @@ for ($attempt = 0; $attempt -lt 180; $attempt++) {
 }
 Write-Error "The model server did not become ready. See: $stderr"
 exit 1
-
