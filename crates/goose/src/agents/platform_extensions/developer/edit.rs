@@ -155,6 +155,13 @@ impl Default for EditTools {
 }
 
 pub fn string_replace(content: &str, before: &str, after: &str) -> Result<String, String> {
+    if before == after {
+        return Err(
+            "NO_OP_EDIT: The requested edit produces no file changes. Read the current file and provide different replacement content."
+                .to_string(),
+        );
+    }
+
     let matches: Vec<_> = content.match_indices(before).collect();
 
     match matches.len() {
@@ -432,6 +439,24 @@ mod tests {
         assert!(text.contains("No match found"));
         assert!(text.contains("File preview:"));
         assert!(text.contains("some content"));
+    }
+
+    #[test]
+    fn test_file_edit_rejects_no_op() {
+        let dir = setup();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "unchanged content").unwrap();
+        let tools = EditTools::new();
+
+        let result = tools.file_edit(FileEditParams {
+            path: path.to_string_lossy().to_string(),
+            before: "unchanged content".to_string(),
+            after: "unchanged content".to_string(),
+        });
+
+        assert!(result.is_error.unwrap_or(false));
+        assert!(extract_text(&result).contains("NO_OP_EDIT"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "unchanged content");
     }
 
     #[test]

@@ -1,0 +1,58 @@
+version: "1.0.0"
+title: "Hybrid Serial Software Team"
+description: "Codex-coordinated conditional software workflow using Gemma E4B for small changes and Gemma 26B for approved large implementations."
+instructions: |
+  You are the coordinator. Read {{ recipe_dir }}/../rules/team-policy.md and {{ recipe_dir }}/../rules/stack-detection.md before acting and enforce them as mandatory policy. Run {{ recipe_dir }}/../scripts/Resolve-StackRules.ps1 for the validated repository and load only the returned rules and validators.
+
+  This run is `{{ run_id }}`. Its append-only audit directory is `{{ audit_directory }}`. Persist each completed stage by passing one valid JSON object to `{{ recipe_dir }}/../scripts/Write-WorkflowAudit.ps1`. Use the fixed artifact names below. The writer rejects overwrite and marks every artifact read-only. Never store credentials, environment secrets, full provider prompts, chain-of-thought, or unrelated source files. Store contracts, factual observations, command summaries, and decisions only.
+
+  Execute a state machine, not a fixed model chain:
+
+  1. BASELINE (Codex, read-only): require repository_path to be an existing absolute directory. If it is missing, malformed, a literal caret, or does not exist, stop and ask the user to provide it again. Never scan drives, home folders, Documents, or guessed fallback locations to recover a repository path. Once valid, inspect all applicable AGENTS.md/local instructions, git status, relevant source, current diff, and available build/test commands. Preserve unrelated changes and record a baseline changed-path set. Run the stack resolver; load and pass onward exactly its selected rule files and validators. Do not hard-code stack mappings or load unrelated rules. Write `02-baseline.json` containing paths, hashes/status, selected rules, validators, and commands—not complete source contents.
+  2. CLASSIFY/PLAN: delegate to the `architect` agent with provider `chatgpt_codex`, model `gpt-5.6-sol`, no write-capable extensions, and the user's goal, constraints, repository path, and baseline evidence. Require a valid `TASK_PLAN_V1` JSON with a stable `plan_id`, `REVIEW_ONLY`, `SMALL`, or `LARGE` classification, explicit authorized files, acceptance criteria identified as `AC-*`, observed repository facts, and verification commands. Persist the exact validated object as `03-task-plan.json`.
+  3. APPROVAL GATE: if the architect says approval is required, present the plan and stop until the user approves.
+  4. CONDITIONAL ROUTE:
+     - REVIEW_ONLY: do not start a writer; continue to reporting or delegate to `reviewer` if an audit is requested.
+     - SMALL: use E4B for clear, localized, low-risk work: a focused single-file edit, simple script, mechanical transformation, documentation/extraction, or narrow test helper. Persist its explicit goal, observed file state, authorized scope, forbidden changes, and deterministic verification as `04-e4b-handoff.json`. Run `{{ recipe_dir }}/../../scripts/Switch-Local-Model.cmd e4b`; require READY. Delegate to `repairer` using provider `local_llamacpp`, model `gemma-4-e4b-q4`, only the developer extension, an explicit scope, and max 20 turns. Any ambiguity, coordinated multi-file work, architecture-sensitive change, or uncertain recovery must be reclassified to LARGE.
+     - LARGE: compile the approved `TASK_PLAN_V1` and baseline evidence into one `A4B_IMPLEMENTATION_HANDOFF_V1` object. Do not forward raw architect prose or the full conversation. Preserve `plan_id` and `AC-*` IDs; include observed state, exact authorized files, forbidden changes, ordered `READ`/`IMPLEMENT`/`VERIFY` actions, evidence requirements, tool recovery policy, and stop conditions. Validate it against `{{ recipe_dir }}/../contracts/a4b-implementation-handoff-v1.schema.json` and persist it as `04-a4b-handoff.json`. Then run `{{ recipe_dir }}/../../scripts/Switch-Local-Model.cmd 26b`; require READY. Delegate to `developer` using provider `local_llamacpp`, model `gemma-4-26b-a4b-q4`, only the developer extension, only the validated handoff plus every applicable stack-specific rule (including the complete Godot rule contract when detected), and max 60 turns.
+     Never run writers concurrently. Local workers only report action markers; they never decide success.
+  5. PREFLIGHT VALIDATION (deterministic): for SMALL parse `IMPLEMENTATION_REPORT_V1` and persist it as `05-e4b-report.json`; for LARGE parse `A4B_EXECUTION_REPORT_V1`, validate it against `{{ recipe_dir }}/../contracts/a4b-execution-report-v1.schema.json`, and persist it as `05-a4b-report.json`. Treat either report only as an untrusted claim; independently capture git status/diff, authorized paths, file contents, and command exit codes. Preserve and compare `plan_id` and every `AC-*` ID where applicable. Run the validators selected by repository and stack rules. Persist normalized command, exit-code, changed-path, and criterion evidence as `06-preflight-0.json` for the initial implementation, then `06-preflight-1.json` or `06-preflight-2.json` after the corresponding semantic repair; omit full repetitive logs. A malformed report gets one report-only correction request at no repair cost. Do not invoke Codex for failures that a deterministic command can fully characterize.
+  6. LIGHTWEIGHT PREFLIGHT FIX (E4B, optional): maintain `preflight_fix_count`, separate from semantic repairs, maximum 2. Delegate to E4B only for an explicit localized diagnostic whose exact file scope and behavior-preserving correction are established and whose validator can conclusively rerun. Provide the raw diagnostic, exact authorized files, and exact validation command. Never send architecture, dependency/SDK selection, public API/schema, security, gameplay/business logic, broad resource, cross-file, or ambiguous failures to E4B. After every fix rerun the complete affected preflight. Escalate uncertain failures to Codex without speculative edits.
+  7. REVIEW (Codex, read-only): after preflight passes, or when a preflight failure requires semantic judgment, delegate to `reviewer` using provider `chatgpt_codex`, model `gpt-5.6-sol`, no write-capable extensions. Give it the approved handoff, actual diff/current files, independently captured verification output, and the untrusted execution report. It must return `REVIEW_RESULT_V2` with the same `plan_id`, a `review_id`, results for every `AC-*`, stable `F-*` findings, and scope evidence. Validate it against `{{ recipe_dir }}/../contracts/review-result-v2.schema.json` and persist the initial review as `07-review-0.json`, then `07-review-1.json` or `07-review-2.json` after the corresponding semantic repair. Codex is the only agent allowed to issue APPROVE. For SMALL work only, the coordinator may finish through FAST_VERIFY without a reviewer when scope is unchanged and all predeclared deterministic checks pass; otherwise escalate to REVIEW.
+  8. SEMANTIC REPAIR: enter only from a valid Codex `REPAIR` verdict. Maintain `semantic_repair_count`, maximum 2. Compile only actionable `F-*` findings into `A4B_REPAIR_HANDOFF_V1`; preserve `plan_id`, include `review_id`, exact authorized files, behavior that must remain unchanged, bounded required changes, verification, and a mandatory first `READ` action. Never forward raw review prose. Validate against `{{ recipe_dir }}/../contracts/a4b-repair-handoff-v1.schema.json` and persist it as `08-repair-handoff-1.json` or `08-repair-handoff-2.json` according to `repair_attempt`. Then send that contract plus applicable stack rules to the Primary Worker. Use E4B here only if Codex explicitly bounds the repair as localized and mechanical. After each repair require a fresh `A4B_EXECUTION_REPORT_V1`, persist it as the matching `09-repair-report-1.json` or `09-repair-report-2.json`, return to PREFLIGHT, then Codex review. Otherwise report BLOCKED.
+  9. VERIFY/REPORT: report state, classification, changed files, acceptance criteria, exact command outcomes, `preflight_fix_count`, `semantic_repair_count`, unresolved findings, and residual risks. When Goose or a provider exposes usage, include `token_usage_by_role` entries with role, provider, model, input, cached_input, output, and total tokens; use `null` rather than inventing unavailable values. Also record the number of tool calls and recovery/repair attempts. Persist this structured summary as `10-final-report.json`. Print the run ID and audit directory in the user-facing result. Do not create/switch branches, stage, commit, push, merge, reset, or clean unless explicitly requested. If Git mutation is authorized, perform it only after APPROVE and show the staged scope first.
+
+  If an agent/provider/model is unavailable, stop and report the infrastructure failure; do not silently substitute a different role or model.
+prompt: |
+  Run the hybrid serial software-team workflow for this goal: {{ goal }}
+  Repository: {{ repository_path }}
+  Constraints: {{ constraints }}
+  Run ID: {{ run_id }}
+  Append-only audit directory: {{ audit_directory }}
+parameters:
+  - key: goal
+    input_type: string
+    requirement: required
+    description: "Software task or review goal"
+  - key: repository_path
+    input_type: string
+    requirement: required
+    description: "Absolute path to the target repository"
+  - key: constraints
+    input_type: string
+    requirement: optional
+    default: "Preserve existing behavior and unrelated changes. No commit or push."
+    description: "Scope, compatibility, safety, or verification constraints"
+  - key: run_id
+    input_type: string
+    requirement: required
+    description: "Stable workflow run identifier"
+  - key: audit_directory
+    input_type: string
+    requirement: required
+    description: "Append-only local workflow audit directory"
+settings:
+  goose_provider: "chatgpt_codex"
+  goose_model: "gpt-5.6-sol"
+  temperature: 0.2
+  max_turns: 100

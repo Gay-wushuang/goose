@@ -1,0 +1,8 @@
+id: godot
+kind: engine
+rule: rule.md
+detect:
+  all_files:
+    - project.godot
+validators:
+  - ../../../validators/godot.ps1

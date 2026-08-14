@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "review-result-v2.schema.json",
+  "title": "REVIEW_RESULT_V2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "plan_id", "review_id", "status", "criteria_results", "findings", "scope_result"],
+  "properties": {
+    "protocol": { "const": "REVIEW_RESULT_V2" },
+    "plan_id": { "type": "string", "minLength": 1 },
+    "review_id": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["APPROVE", "REPAIR", "BLOCKED"] },
+    "criteria_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "evidence"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^AC-[0-9]+$" },
+          "status": { "enum": ["PASS", "FAIL", "UNVERIFIED"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "path", "location", "observed", "expected", "required_action", "verification"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^F-[0-9]+$" },
+          "severity": { "enum": ["BLOCKER", "HIGH", "MEDIUM", "LOW"] },
+          "path": { "type": "string" },
+          "location": { "type": "string" },
+          "observed": { "type": "string", "minLength": 1 },
+          "expected": { "type": "string", "minLength": 1 },
+          "required_action": { "type": "string", "minLength": 1 },
+          "verification": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "scope_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unexpected_files"],
+      "properties": {
+        "unexpected_files": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

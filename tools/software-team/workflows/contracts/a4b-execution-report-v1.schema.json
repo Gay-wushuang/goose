@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "a4b-execution-report-v1.schema.json",
+  "title": "A4B_EXECUTION_REPORT_V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol", "plan_id", "status", "changed_files", "criteria",
+    "commands", "unverified_claims", "scope_violation"
+  ],
+  "properties": {
+    "protocol": { "const": "A4B_EXECUTION_REPORT_V1" },
+    "plan_id": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["PATCH_APPLIED", "TOOL_FAILED", "ESCALATE"] },
+    "changed_files": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "evidence"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^AC-[0-9]+$" },
+          "status": { "enum": ["IMPLEMENTED", "NOT_IMPLEMENTED", "UNCERTAIN"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code"],
+        "properties": {
+          "command": { "type": "string", "minLength": 1 },
+          "exit_code": { "type": "integer" },
+          "result": { "type": "string" }
+        }
+      }
+    },
+    "unverified_claims": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "scope_violation": { "type": "boolean" }
+  }
+}

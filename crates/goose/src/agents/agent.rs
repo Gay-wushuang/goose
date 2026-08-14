@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -49,8 +50,10 @@ use crate::security::egress_inspector::EgressInspector;
 use crate::security::security_inspector::SecurityInspector;
 use crate::session::extension_data::{EnabledExtensionsState, ExtensionState};
 use crate::session::{Session, SessionManager, SessionNameUpdate};
-use crate::tool_inspection::ToolInspectionManager;
-use crate::tool_monitor::RepetitionInspector;
+use crate::tool_inspection::{InspectionAction, InspectionResult, ToolInspectionManager};
+use crate::tool_monitor::{
+    classify_tool_failure, FailureType, ProgressDecision, ProgressWatchdog, RepetitionInspector,
+};
 use crate::utils::is_token_cancelled;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
@@ -61,13 +64,160 @@ use rmcp::model::{
     GetPromptResult, Prompt, ServerNotification, Tool,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 const DEFAULT_MAX_TURNS: u32 = 1000;
 const DEFAULT_STOP_HOOK_BLOCK_CAP: u32 = 8;
+const DEFAULT_MAX_RUNTIME_TOOL_CALLS: u64 = 250;
+const DEFAULT_MAX_RUNTIME_SECONDS: u64 = 3600;
 const COMPACTION_PROGRESS_TEXT: &str = "goose is compacting the conversation...";
+
+fn has_fatal_tool_loop(results: &[InspectionResult]) -> bool {
+    results.iter().any(|result| {
+        result.finding_id.as_deref() == Some("REP-001") && result.action == InspectionAction::Deny
+    })
+}
+
+fn stable_hash(value: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn short_tool_name(name: &str) -> &str {
+    name.rsplit("__").next().unwrap_or(name)
+}
+
+fn progress_request_hash(tool_call: &CallToolRequestParams) -> Option<u64> {
+    if !matches!(
+        short_tool_name(tool_call.name.as_ref()),
+        "edit" | "write" | "shell"
+    ) {
+        return None;
+    }
+    Some(stable_hash(format!(
+        "{}:{:?}",
+        tool_call.name, tool_call.arguments
+    )))
+}
+
+fn tool_target_content_hash(
+    tool_call: &CallToolRequestParams,
+    working_dir: &std::path::Path,
+) -> Option<u64> {
+    if !matches!(short_tool_name(tool_call.name.as_ref()), "edit" | "write") {
+        return None;
+    }
+    let path = tool_call.arguments.as_ref()?.get("path")?.as_str()?;
+    let path = std::path::Path::new(path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    };
+    std::fs::read(resolved).ok().map(stable_hash)
+}
+
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(bytes.as_ref());
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{encoded}")
+}
+
+fn tool_request_sha256(tool_call: &CallToolRequestParams) -> String {
+    let value = serde_json::json!({
+        "name": tool_call.name,
+        "arguments": tool_call.arguments,
+    });
+    sha256_hex(serde_json::to_vec(&value).unwrap_or_default())
+}
+
+fn tool_target_content_sha256(
+    tool_call: &CallToolRequestParams,
+    working_dir: &std::path::Path,
+) -> Option<String> {
+    if !matches!(short_tool_name(tool_call.name.as_ref()), "edit" | "write") {
+        return None;
+    }
+    let path = tool_call.arguments.as_ref()?.get("path")?.as_str()?;
+    let path = std::path::Path::new(path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    };
+    std::fs::read(resolved).ok().map(sha256_hex)
+}
+
+fn failure_type_name(failure_type: &FailureType) -> String {
+    serde_json::to_value(failure_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "UNCLASSIFIED".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct ToolLoopEventContext {
+    event_id: String,
+    failure_type: &'static str,
+    causal_failure: Option<String>,
+    tool: String,
+    request_hash: String,
+    target_paths: Vec<String>,
+    last_observed_file_hash: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum RecoveryRequirement {
+    ReadBeforeRetry {
+        target_path: String,
+        causal_failure: FailureType,
+    },
+    CheckPathBeforeRetry,
+    StopAndReport,
+}
+
+fn tool_argument_path(tool_call: &CallToolRequestParams) -> Option<String> {
+    tool_call
+        .arguments
+        .as_ref()?
+        .get("path")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn is_mutating_tool(tool_call: &CallToolRequestParams) -> bool {
+    matches!(short_tool_name(tool_call.name.as_ref()), "edit" | "write")
+}
+
+fn is_target_read(tool_call: &CallToolRequestParams, target_path: &str) -> bool {
+    if short_tool_name(tool_call.name.as_ref()) != "shell" {
+        return false;
+    }
+    let Some(command) = tool_call
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let lower = command.to_ascii_lowercase();
+    let normalized_target = target_path.replace('\\', "/").to_ascii_lowercase();
+    let normalized_command = lower.replace('\\', "/");
+    (lower.contains("get-content")
+        || lower.starts_with("type ")
+        || lower.contains(" type ")
+        || lower.starts_with("cat ")
+        || lower.contains(" cat "))
+        && normalized_command.contains(&normalized_target)
+}
 const MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
 const MAX_EMPTY_TURN_RETRIES: u32 = 3;
 const EMPTY_TURN_MESSAGE: &str =
@@ -254,6 +404,8 @@ pub struct Agent {
 
     pub(super) retry_manager: RetryManager,
     pub(super) tool_inspection_manager: ToolInspectionManager,
+    progress_watchdogs: Mutex<HashMap<String, ProgressWatchdog>>,
+    recovery_requirements: Mutex<HashMap<String, RecoveryRequirement>>,
     pub(super) hook_manager: crate::hooks::HookManager,
     #[cfg(test)]
     stop_hook_block_cap_override: Option<u32>,
@@ -454,6 +606,8 @@ impl Agent {
                 provider.clone(),
                 inspection_session_manager,
             ),
+            progress_watchdogs: Mutex::new(HashMap::new()),
+            recovery_requirements: Mutex::new(HashMap::new()),
             hook_manager: crate::hooks::HookManager::load(
                 std::env::current_dir().ok().as_deref(),
                 use_login_shell_path,
@@ -724,8 +878,14 @@ impl Agent {
             session_manager,
         )));
 
-        // Add repetition inspector (lower priority - basic repetition checking)
-        tool_inspection_manager.add_inspector(Box::new(RepetitionInspector::new(None)));
+        // Add repetition inspector (lower priority - basic repetition checking).
+        // The environment setting also applies to delegated agents in this process.
+        let max_tool_repetitions = std::env::var("GOOSE_MAX_TOOL_REPETITIONS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .or(Some(2));
+        tool_inspection_manager
+            .add_inspector(Box::new(RepetitionInspector::new(max_tool_repetitions)));
 
         tool_inspection_manager
     }
@@ -851,6 +1011,7 @@ impl Agent {
     async fn handle_approved_and_denied_tools(
         &self,
         permission_check_result: &PermissionCheckResult,
+        inspection_results: &[InspectionResult],
         request_to_response_map: &mut HashMap<String, Message>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         session: &Session,
@@ -891,20 +1052,38 @@ impl Agent {
             }
         }
 
-        Self::handle_denied_tools(permission_check_result, request_to_response_map);
+        Self::handle_denied_tools(
+            permission_check_result,
+            inspection_results,
+            request_to_response_map,
+        );
         Ok(tool_futures)
     }
 
     fn handle_denied_tools(
         permission_check_result: &PermissionCheckResult,
+        inspection_results: &[InspectionResult],
         request_to_response_map: &mut HashMap<String, Message>,
     ) {
         for request in &permission_check_result.denied {
             if let Some(response) = request_to_response_map.get_mut(&request.id) {
+                let reason = inspection_results
+                    .iter()
+                    .find(|result| {
+                        result.tool_request_id == request.id
+                            && matches!(result.action, InspectionAction::Deny)
+                    })
+                    .or_else(|| {
+                        inspection_results
+                            .iter()
+                            .find(|result| result.tool_request_id == request.id)
+                    })
+                    .map(|result| result.reason.as_str())
+                    .unwrap_or(DECLINED_RESPONSE);
                 response.add_tool_response_with_metadata(
                     request.id.clone(),
                     Ok(CallToolResult::error(vec![
-                        rmcp::model::ContentBlock::text(DECLINED_RESPONSE),
+                        rmcp::model::ContentBlock::text(reason),
                     ])),
                     request.metadata.as_ref(),
                 );
@@ -2008,9 +2187,48 @@ impl Agent {
             let mut consecutive_stop_hook_blocks = 0u32;
             let stop_hook_block_cap = self.stop_hook_block_cap();
             let mut can_drain_pending_steers = false;
+            let runtime_started = std::time::Instant::now();
+            let mut runtime_tool_calls = 0u64;
+            let max_runtime_tool_calls = std::env::var("GOOSE_MAX_RUNTIME_TOOL_CALLS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MAX_RUNTIME_TOOL_CALLS);
+            let max_runtime_seconds = std::env::var("GOOSE_MAX_RUNTIME_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MAX_RUNTIME_SECONDS);
+            self.progress_watchdogs
+                .lock()
+                .await
+                .insert(session_config.id.clone(), ProgressWatchdog::default());
+            self.recovery_requirements
+                .lock()
+                .await
+                .remove(&session_config.id);
 
             loop {
                 if is_token_cancelled(&cancel_token) {
+                    break;
+                }
+
+                if runtime_started.elapsed().as_secs() >= max_runtime_seconds {
+                    let message_text = format!(
+                        "ABORTED\n{}",
+                        serde_json::json!({
+                            "type": "TASK_BUDGET_EXCEEDED",
+                            "reason": "maximum runtime exceeded",
+                            "runtime_seconds": runtime_started.elapsed().as_secs(),
+                            "max_runtime_seconds": max_runtime_seconds,
+                            "tool_calls": runtime_tool_calls,
+                        })
+                    );
+                    let message = persist_message_with_id(
+                        &session_manager,
+                        &session_config.id,
+                        Message::assistant().with_text(message_text.clone()),
+                    ).await?;
+                    last_assistant_text = message_text;
+                    yield AgentEvent::Message(message);
                     break;
                 }
 
@@ -2147,6 +2365,9 @@ impl Agent {
                 let mut exit_chat = false;
                 let mut provider_errored = false;
                 let mut provider_produced_content = false;
+                let mut tool_loop_detected = false;
+                let mut runtime_abort_reason: Option<String> = None;
+                let mut runtime_loop_event: Option<ToolLoopEventContext> = None;
                 let mut pending_final_output: Option<String> = None;
                 let mut pending_turn_usage: Option<ProviderUsage> = None;
                 let mut preferred_turn_usage_message_id: Option<String> = None;
@@ -2248,6 +2469,11 @@ impl Agent {
                                     messages_to_add.push(response);
                                     continue;
                                 }
+                                runtime_tool_calls += num_tool_requests as u64;
+                                if runtime_tool_calls > max_runtime_tool_calls {
+                                    tool_loop_detected = true;
+                                    runtime_abort_reason = Some("maximum tool-call budget exceeded".to_string());
+                                }
 
                                 let mut request_to_response_map = HashMap::new();
                                 let mut request_metadata: HashMap<String, Option<ProviderMetadata>> = HashMap::new();
@@ -2287,7 +2513,7 @@ impl Agent {
                                     }
                                 } else {
                                     // Run all tool inspectors
-                                    let inspection_results = self.tool_inspection_manager
+                                    let mut inspection_results = self.tool_inspection_manager
                                         .inspect_tools(
                                             &session_config.id,
                                             &remaining_requests,
@@ -2295,6 +2521,97 @@ impl Agent {
                                             goose_mode,
                                         )
                                         .await?;
+
+                                    if let Some(requirement) = self
+                                        .recovery_requirements
+                                        .lock()
+                                        .await
+                                        .get(&session_config.id)
+                                        .cloned()
+                                    {
+                                        for request in &remaining_requests {
+                                            let Ok(tool_call) = &request.tool_call else {
+                                                continue;
+                                            };
+                                            let blocked_reason = match &requirement {
+                                                RecoveryRequirement::ReadBeforeRetry { target_path, .. }
+                                                    if is_mutating_tool(tool_call) => Some(format!(
+                                                        "REC-001: A successful read of '{}' is required before another edit or write. Change strategy and observe the current file first.",
+                                                        target_path
+                                                    )),
+                                                RecoveryRequirement::CheckPathBeforeRetry
+                                                    if is_mutating_tool(tool_call) => Some(
+                                                        "REC-002: Verify the explicitly declared path before another edit or write. Do not scan the entire disk."
+                                                            .to_string(),
+                                                    ),
+                                                RecoveryRequirement::StopAndReport => Some(
+                                                    "REC-003: The previous deterministic failure requires stopping and reporting to the user; further tool execution is blocked."
+                                                        .to_string(),
+                                                ),
+                                                _ => None,
+                                            };
+                                            if let Some(reason) = blocked_reason {
+                                                inspection_results.push(InspectionResult {
+                                                    tool_request_id: request.id.clone(),
+                                                    action: InspectionAction::Deny,
+                                                    reason,
+                                                    confidence: 1.0,
+                                                    inspector_name: "recovery_policy".to_string(),
+                                                    finding_id: Some("REC-001".to_string()),
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    if has_fatal_tool_loop(&inspection_results) {
+                                        tool_loop_detected = true;
+                                        runtime_abort_reason = Some(
+                                            "exact high-risk tool-call repetition exceeded the limit"
+                                                .to_string(),
+                                        );
+                                        if let Some(fatal_result) = inspection_results.iter().find(|result| {
+                                            result.finding_id.as_deref() == Some("REP-001")
+                                                && result.action == InspectionAction::Deny
+                                        }) {
+                                            if let Some(tool_call) = remaining_requests.iter().find_map(|request| {
+                                                (request.id == fatal_result.tool_request_id)
+                                                    .then(|| request.tool_call.as_ref().ok())
+                                                    .flatten()
+                                            }) {
+                                                let causal_failure = self
+                                                    .recovery_requirements
+                                                    .lock()
+                                                    .await
+                                                    .get(&session_config.id)
+                                                    .and_then(|requirement| match requirement {
+                                                        RecoveryRequirement::ReadBeforeRetry {
+                                                            causal_failure,
+                                                            ..
+                                                        } => Some(failure_type_name(causal_failure)),
+                                                        RecoveryRequirement::CheckPathBeforeRetry => {
+                                                            Some("PATH_ERROR".to_string())
+                                                        }
+                                                        RecoveryRequirement::StopAndReport => {
+                                                            Some("PERMISSION_ERROR".to_string())
+                                                        }
+                                                    });
+                                                runtime_loop_event = Some(ToolLoopEventContext {
+                                                    event_id: format!("loop-{}", uuid::Uuid::new_v4()),
+                                                    failure_type: "EXACT_CALL_REPETITION",
+                                                    causal_failure,
+                                                    tool: short_tool_name(tool_call.name.as_ref()).to_string(),
+                                                    request_hash: tool_request_sha256(tool_call),
+                                                    target_paths: tool_argument_path(tool_call)
+                                                        .into_iter()
+                                                        .collect(),
+                                                    last_observed_file_hash: tool_target_content_sha256(
+                                                        tool_call,
+                                                        &session.working_dir,
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
 
                                     let permission_check_result = self.tool_inspection_manager
                                         .process_inspection_results_with_permission_inspector(
@@ -2311,6 +2628,33 @@ impl Agent {
                                             result
                                         });
 
+                                    for request in &permission_check_result.denied {
+                                        let findings = inspection_results.iter().filter(|result| {
+                                            result.tool_request_id == request.id
+                                                && result.action == InspectionAction::Deny
+                                        });
+                                        let mut runtime_blocked = false;
+                                        let mut broke_loop = false;
+                                        for finding in findings {
+                                            match finding.finding_id.as_deref() {
+                                                Some("REP-001") => {
+                                                    runtime_blocked = true;
+                                                    broke_loop = true;
+                                                }
+                                                Some("REC-001") => runtime_blocked = true,
+                                                _ => {}
+                                            }
+                                        }
+                                        if runtime_blocked {
+                                            self.progress_watchdogs
+                                                .lock()
+                                                .await
+                                                .entry(session_config.id.clone())
+                                                .or_default()
+                                                .record_blocked(broke_loop);
+                                        }
+                                    }
+
                                     // Track extension requests
                                     let mut enable_extension_request_ids = vec![];
                                     for request in &remaining_requests {
@@ -2321,8 +2665,41 @@ impl Agent {
                                         }
                                     }
 
+                                    let progress_starts: HashMap<
+                                        String,
+                                        (u64, Option<u64>, CallToolRequestParams),
+                                    > = remaining_requests
+                                        .iter()
+                                        .filter_map(|request| {
+                                            let tool_call = request.tool_call.as_ref().ok()?;
+                                            let request_hash = progress_request_hash(tool_call)?;
+                                            let state_before = tool_target_content_hash(
+                                                tool_call,
+                                                &session.working_dir,
+                                            );
+                                            Some((
+                                                request.id.clone(),
+                                                (request_hash, state_before, tool_call.clone()),
+                                            ))
+                                        })
+                                        .collect();
+                                    let tool_calls_by_id: HashMap<String, CallToolRequestParams> =
+                                        remaining_requests
+                                            .iter()
+                                            .filter_map(|request| {
+                                                request
+                                                    .tool_call
+                                                    .as_ref()
+                                                    .ok()
+                                                    .map(|tool_call| {
+                                                        (request.id.clone(), tool_call.clone())
+                                                    })
+                                            })
+                                            .collect();
+
                                     let mut tool_futures = self.handle_approved_and_denied_tools(
                                         &permission_check_result,
+                                        &inspection_results,
                                         &mut request_to_response_map,
                                         cancel_token.clone(),
                                         &session,
@@ -2372,7 +2749,153 @@ impl Agent {
                                                                 }
                                                                 yield AgentEvent::Message(msg);
                                                             }
-                                                            ToolStreamItem::Result(output) => {
+                                                            ToolStreamItem::Result(mut output) => {
+                                                                if let Some(tool_call) = tool_calls_by_id.get(&request_id) {
+                                                                    let succeeded = matches!(&output, Ok(result) if !result.is_error.unwrap_or(false));
+                                                                    if succeeded {
+                                                                        let should_clear = self
+                                                                            .recovery_requirements
+                                                                            .lock()
+                                                                            .await
+                                                                            .get(&session_config.id)
+                                                                            .is_some_and(|requirement| match requirement {
+                                                                                RecoveryRequirement::ReadBeforeRetry { target_path, .. } => {
+                                                                                    is_target_read(tool_call, target_path)
+                                                                                }
+                                                                                RecoveryRequirement::CheckPathBeforeRetry => {
+                                                                                    matches!(short_tool_name(tool_call.name.as_ref()), "tree" | "shell")
+                                                                                }
+                                                                                RecoveryRequirement::StopAndReport => false,
+                                                                            });
+                                                                        if should_clear {
+                                                                            self.recovery_requirements
+                                                                                .lock()
+                                                                                .await
+                                                                                .remove(&session_config.id);
+                                                                        }
+                                                                    }
+                                                                }
+
+                                                                if let Some((request_hash, state_before, tool_call)) = progress_starts.get(&request_id) {
+                                                                    let failed = match &output {
+                                                                        Ok(result) => result.is_error.unwrap_or(false),
+                                                                        Err(_) => true,
+                                                                    };
+                                                                    let result_hash = stable_hash(format!("{output:?}"));
+                                                                    let state_after = tool_target_content_hash(
+                                                                        tool_call,
+                                                                        &session.working_dir,
+                                                                    );
+                                                                    let decision = self
+                                                                        .progress_watchdogs
+                                                                        .lock()
+                                                                        .await
+                                                                        .entry(session_config.id.clone())
+                                                                        .or_default()
+                                                                        .observe(
+                                                                            *request_hash,
+                                                                            result_hash,
+                                                                            *state_before,
+                                                                            state_after,
+                                                                            failed,
+                                                                        );
+
+                                                                    let runtime_message = match decision {
+                                                                        ProgressDecision::Progress => None,
+                                                                        ProgressDecision::Warning => Some(
+                                                                            "NO_PROGRESS_WARNING: The previous identical operation produced the same result and no observable state change. Read the feedback and change strategy before retrying."
+                                                                        ),
+                                                                        ProgressDecision::Abort => {
+                                                                            tool_loop_detected = true;
+                                                                            runtime_abort_reason = Some(
+                                                                                "identical request and result produced no observable state change"
+                                                                                    .to_string(),
+                                                                            );
+                                                                            runtime_loop_event = Some(ToolLoopEventContext {
+                                                                                event_id: format!("loop-{}", uuid::Uuid::new_v4()),
+                                                                                failure_type: "NO_PROGRESS_OBSERVATION",
+                                                                                causal_failure: failed.then(|| "TOOL_FAILURE".to_string()),
+                                                                                tool: short_tool_name(tool_call.name.as_ref()).to_string(),
+                                                                                request_hash: tool_request_sha256(tool_call),
+                                                                                target_paths: tool_argument_path(tool_call).into_iter().collect(),
+                                                                                last_observed_file_hash: tool_target_content_sha256(
+                                                                                    tool_call,
+                                                                                    &session.working_dir,
+                                                                                ),
+                                                                            });
+                                                                            Some(
+                                                                                "TOOL_LOOP_DETECTED: The same operation repeatedly produced the same result with no observable state change. The agent turn will now stop."
+                                                                            )
+                                                                        }
+                                                                    };
+
+                                                                    if let Some(runtime_message) = runtime_message {
+                                                                        match &mut output {
+                                                                            Ok(result) => result.content.push(ContentBlock::text(runtime_message)),
+                                                                            Err(error) => {
+                                                                                let original_error = error.to_string();
+                                                                                output = Ok(CallToolResult::error(vec![ContentBlock::text(
+                                                                                    format!("{original_error}\n\n{runtime_message}")
+                                                                                )]));
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+
+                                                                if let (Some(tool_call), Ok(result)) = (
+                                                                    tool_calls_by_id.get(&request_id),
+                                                                    &mut output,
+                                                                ) {
+                                                                    if let Some(diagnosis) = classify_tool_failure(
+                                                                        tool_call.name.as_ref(),
+                                                                        result,
+                                                                    ) {
+                                                                        let requirement = match diagnosis.failure_type {
+                                                                            FailureType::NoOpEdit
+                                                                            | FailureType::StateMismatch
+                                                                            | FailureType::AmbiguousMatch => {
+                                                                                tool_argument_path(tool_call).map(|target_path| {
+                                                                                    RecoveryRequirement::ReadBeforeRetry {
+                                                                                        target_path,
+                                                                                        causal_failure: diagnosis.failure_type.clone(),
+                                                                                    }
+                                                                                })
+                                                                            }
+                                                                            FailureType::PathError => Some(
+                                                                                RecoveryRequirement::CheckPathBeforeRetry,
+                                                                            ),
+                                                                            FailureType::PermissionError => Some(
+                                                                                RecoveryRequirement::StopAndReport,
+                                                                            ),
+                                                                            _ => None,
+                                                                        };
+
+                                                                        if let Some(requirement) = requirement {
+                                                                            self.recovery_requirements
+                                                                                .lock()
+                                                                                .await
+                                                                                .insert(session_config.id.clone(), requirement);
+                                                                        }
+                                                                        if diagnosis.failure_type
+                                                                            == FailureType::PermissionError
+                                                                        {
+                                                                            tool_loop_detected = true;
+                                                                            runtime_abort_reason = Some(
+                                                                                "deterministic permission failure requires user authorization"
+                                                                                    .to_string(),
+                                                                            );
+                                                                        }
+
+                                                                        let diagnosis_json = serde_json::to_string(
+                                                                            &diagnosis,
+                                                                        )
+                                                                        .unwrap_or_else(|_| "{}".to_string());
+                                                                        result.content.push(ContentBlock::text(format!(
+                                                                            "FAILURE_DIAGNOSIS\n{diagnosis_json}"
+                                                                        )));
+                                                                    }
+                                                                }
+
                                                                 if let Ok(ref call_result) = output {
                                                                     if let Some(ref meta) = call_result.meta {
                                                                         if let Some(notification_data) = meta.0.get("platform_notification") {
@@ -2628,6 +3151,64 @@ impl Agent {
                                 no_tools_called = false;
                                 // Agent is actively working — re-check goal when it next finishes
                                 goal_check_pending = false;
+
+                                if tool_loop_detected {
+                                    let metrics = self
+                                        .progress_watchdogs
+                                        .lock()
+                                        .await
+                                        .get(&session_config.id)
+                                        .map(ProgressWatchdog::metrics)
+                                        .unwrap_or_default();
+                                    let event = runtime_loop_event.unwrap_or_else(|| ToolLoopEventContext {
+                                        event_id: format!("loop-{}", uuid::Uuid::new_v4()),
+                                        failure_type: "RUNTIME_POLICY_ABORT",
+                                        causal_failure: None,
+                                        tool: "unknown".to_string(),
+                                        request_hash: "unavailable".to_string(),
+                                        target_paths: Vec::new(),
+                                        last_observed_file_hash: None,
+                                    });
+                                    let message_text = format!(
+                                        "TOOL_LOOP_DETECTED\nABORTED\n{}",
+                                        serde_json::json!({
+                                            "protocol": "TOOL_LOOP_EVENT_V1",
+                                            "type": "TOOL_LOOP_DETECTED",
+                                            "event_id": event.event_id,
+                                            "reason": runtime_abort_reason.as_deref().unwrap_or("runtime safety policy triggered"),
+                                            "failure": {
+                                                "type": event.failure_type,
+                                                "causal_failure": event.causal_failure,
+                                                "tool": event.tool,
+                                                "request_hash": event.request_hash,
+                                                "target_paths": event.target_paths,
+                                                "last_observed_file_hash": event.last_observed_file_hash,
+                                            },
+                                            "telemetry": {
+                                                "generated_tool_calls": runtime_tool_calls,
+                                                "executed_tool_calls": metrics.executed_tool_calls,
+                                                "productive_actions": metrics.productive_actions,
+                                                "failed_actions": metrics.failed_actions,
+                                                "blocked_actions": metrics.blocked_actions,
+                                                "no_progress_actions": metrics.no_progress_actions,
+                                                "recovery_count": metrics.recovery_count,
+                                                "loop_breaks": metrics.loop_breaks,
+                                                "execution_efficiency": metrics.execution_efficiency(),
+                                                "agent_efficiency": metrics.agent_efficiency(runtime_tool_calls),
+                                            },
+                                            "runtime_seconds": runtime_started.elapsed().as_secs(),
+                                            "worktree_preserved": true,
+                                        })
+                                    );
+                                    last_assistant_text = message_text.clone();
+                                    let message = push_message_with_id(
+                                        &mut messages_to_add,
+                                        Message::assistant().with_text(message_text),
+                                    );
+                                    yield AgentEvent::Message(message);
+                                    exit_chat = true;
+                                    break;
+                                }
                             }
                         }
                         #[allow(unused_variables)]
@@ -3610,6 +4191,74 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repetition_denial_is_a_fatal_tool_loop() {
+        let result = InspectionResult {
+            tool_request_id: "call-3".to_string(),
+            action: InspectionAction::Deny,
+            reason: "repeated".to_string(),
+            confidence: 1.0,
+            inspector_name: "repetition".to_string(),
+            finding_id: Some("REP-001".to_string()),
+        };
+        assert!(has_fatal_tool_loop(&[result]));
+    }
+
+    #[test]
+    fn unrelated_denial_is_not_a_fatal_tool_loop() {
+        let result = InspectionResult {
+            tool_request_id: "call-1".to_string(),
+            action: InspectionAction::Deny,
+            reason: "permission".to_string(),
+            confidence: 1.0,
+            inspector_name: "permission".to_string(),
+            finding_id: Some("PERM-001".to_string()),
+        };
+        assert!(!has_fatal_tool_loop(&[result]));
+    }
+
+    #[test]
+    fn recovery_policy_recognizes_only_explicit_target_reads() {
+        let target_read =
+            CallToolRequestParams::new("developer__shell").with_arguments(rmcp::object!({
+                "command": "powershell -Command \"Get-Content Scripts/SnakeGame.cs\""
+            }));
+        assert!(is_target_read(&target_read, "Scripts/SnakeGame.cs"));
+
+        let unrelated_read = CallToolRequestParams::new("shell")
+            .with_arguments(rmcp::object!({ "command": "Get-Content README.md" }));
+        assert!(!is_target_read(&unrelated_read, "Scripts/SnakeGame.cs"));
+
+        let disk_scan = CallToolRequestParams::new("shell")
+            .with_arguments(rmcp::object!({ "command": "Get-ChildItem C:\\ -Recurse" }));
+        assert!(!is_target_read(&disk_scan, "Scripts/SnakeGame.cs"));
+    }
+
+    #[test]
+    fn recovery_policy_identifies_mutating_tools() {
+        assert!(is_mutating_tool(&CallToolRequestParams::new("edit")));
+        assert!(is_mutating_tool(&CallToolRequestParams::new(
+            "developer__write"
+        )));
+        assert!(!is_mutating_tool(&CallToolRequestParams::new("shell")));
+        assert!(!is_mutating_tool(&CallToolRequestParams::new("tree")));
+    }
+
+    #[test]
+    fn loop_event_hashes_are_stable_and_do_not_expose_arguments() {
+        let call = CallToolRequestParams::new("edit").with_arguments(rmcp::object!({
+            "path": "ScoreManager.cs",
+            "before": "secret-before",
+            "after": "secret-after"
+        }));
+        let first = tool_request_sha256(&call);
+        let second = tool_request_sha256(&call);
+        assert_eq!(first, second);
+        assert!(first.starts_with("sha256:"));
+        assert_eq!(first.len(), 71);
+        assert!(!first.contains("secret"));
+    }
     use crate::permission::permission_confirmation::PrincipalType;
     use crate::plugins::discovery::{DiscoveredPlugin, PluginScope};
     use crate::providers::base::{stream_from_single_message, MessageStream, PermissionRouting};

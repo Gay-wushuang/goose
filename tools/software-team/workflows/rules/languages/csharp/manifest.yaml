@@ -1,0 +1,11 @@
+id: csharp
+kind: language
+rule: rule.md
+detect:
+  any_globs:
+    - "*.csproj"
+    - "*.sln"
+    - "**/*.csproj"
+    - "**/*.sln"
+validators:
+  - ../../../validators/dotnet.ps1

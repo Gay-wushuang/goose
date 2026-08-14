@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "a4b-implementation-handoff-v1.schema.json",
+  "title": "A4B_IMPLEMENTATION_HANDOFF_V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol", "plan_id", "repository_path", "goal", "observed_state",
+    "authorized_files", "forbidden_changes", "acceptance_criteria",
+    "ordered_actions", "tool_policy", "stop_conditions"
+  ],
+  "properties": {
+    "protocol": { "const": "A4B_IMPLEMENTATION_HANDOFF_V1" },
+    "plan_id": { "type": "string", "minLength": 1 },
+    "repository_path": { "type": "string", "minLength": 1 },
+    "goal": { "type": "string", "minLength": 1 },
+    "observed_state": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "fact"],
+        "properties": {
+          "path": { "type": "string" },
+          "fact": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "authorized_files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "forbidden_changes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "requirement", "evidence_required"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^AC-[0-9]+$" },
+          "requirement": { "type": "string", "minLength": 1 },
+          "evidence_required": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "ordered_actions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "action"],
+        "properties": {
+          "step": { "type": "integer", "minimum": 1 },
+          "action": { "enum": ["READ", "IMPLEMENT", "VERIFY"] },
+          "paths": { "type": "array", "items": { "type": "string" } },
+          "instruction": { "type": "string" },
+          "commands": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "tool_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "read_before_write", "on_first_edit_failure",
+        "on_second_edit_failure", "never_repeat_identical_request"
+      ],
+      "properties": {
+        "read_before_write": { "const": true },
+        "on_first_edit_failure": { "const": "READ_TARGET_AND_REBUILD_PATCH" },
+        "on_second_edit_failure": { "const": "FULL_WRITE_IF_FILE_UNDER_300_LINES" },
+        "never_repeat_identical_request": { "const": true }
+      }
+    },
+    "stop_conditions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

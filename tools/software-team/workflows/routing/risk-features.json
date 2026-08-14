@@ -1,0 +1,120 @@
+{
+  "manifest_version": "1.0.0",
+  "router_version": "0.1.0",
+  "default_tier": "L1",
+  "rules": [
+    {
+      "id": "task.mechanical-change.v1",
+      "version": "1.0.0",
+      "feature": "mechanical_change",
+      "minimum_tier": "L0",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "format_only", "regex": "(?i)格式化|format(?:ting)? only|仅格式" },
+        { "id": "comment_or_docs", "regex": "(?i)仅?(?:修改|更新)?(?:注释|文档)|comments? only|docs? only" },
+        { "id": "exact_text_replace", "regex": "(?i)精确替换|exact (?:text )?replace|把.{1,80}改成" }
+      ]
+    },
+    {
+      "id": "scope.multi-file.v1",
+      "version": "1.0.0",
+      "feature": "multi_file_declared",
+      "minimum_tier": "L1_PLUS",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "multi_file", "regex": "(?i)多个文件|多文件|跨文件|multi[- ]file|across (?:multiple )?files" },
+        { "id": "cross_module", "regex": "(?i)跨模块|多个模块|cross[- ]module|across modules" }
+      ]
+    },
+    {
+      "id": "runtime.behavior-change.v1",
+      "version": "1.0.0",
+      "feature": "runtime_behavior_change",
+      "minimum_tier": "L1_PLUS",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "pause_state", "regex": "(?i)暂停|恢复游戏|pause|resume" },
+        { "id": "game_loop_change", "regex": "(?i)游戏循环|主循环|更新循环|game[ _-]?loop|_Process|_PhysicsProcess" },
+        { "id": "runtime_state", "regex": "(?i)运行时状态|状态机|runtime state|state machine" }
+      ]
+    },
+    {
+      "id": "contract.public-api.v1",
+      "version": "1.0.0",
+      "feature": "public_api_change",
+      "minimum_tier": "L2",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "public_api", "regex": "(?i)公共 ?API|公开接口|public API|breaking change" },
+        { "id": "schema", "regex": "(?i)数据库结构|数据结构迁移|schema|存档格式|save format" }
+      ]
+    },
+    {
+      "id": "dependency.change.v1",
+      "version": "1.0.0",
+      "feature": "dependency_change",
+      "minimum_tier": "L2",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "dependency", "regex": "(?i)新增依赖|升级依赖|更换依赖|add dependency|upgrade dependency|package reference" },
+        { "id": "sdk_runtime", "regex": "(?i)更换 ?SDK|升级 ?SDK|运行时升级|runtime upgrade|SDK migration" }
+      ]
+    },
+    {
+      "id": "security.sensitive.v1",
+      "version": "1.0.0",
+      "feature": "security_sensitive",
+      "minimum_tier": "L2",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "auth", "regex": "(?i)身份验证|鉴权|权限系统|authentication|authorization|OAuth" },
+        { "id": "secret", "regex": "(?i)密钥|凭据|令牌存储|secret|credential|token storage" }
+      ]
+    },
+    {
+      "id": "operation.destructive.v1",
+      "version": "1.0.0",
+      "feature": "destructive_operation",
+      "minimum_tier": "L2",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "delete_or_clean", "regex": "(?i)批量删除|清空|重置仓库|delete all|remove all|git clean|reset --hard" },
+        { "id": "migration", "regex": "(?i)迁移数据|破坏性迁移|destructive migration|data migration" }
+      ]
+    },
+    {
+      "id": "operation.deployment.v1",
+      "version": "1.0.0",
+      "feature": "deployment_or_system_change",
+      "minimum_tier": "L2",
+      "sources": ["user_prompt", "constraints"],
+      "patterns": [
+        { "id": "deploy_publish", "regex": "(?i)部署|发布到|上线|deploy|publish release" },
+        { "id": "system_config", "regex": "(?i)系统变量|环境变量|注册表|服务安装|system configuration|registry|install service" }
+      ]
+    }
+  ],
+  "repository_rules": [
+    {
+      "id": "validator.godot-required.v1",
+      "version": "1.0.0",
+      "feature": "external_validator_available",
+      "minimum_tier": "L0",
+      "relative_path": "project.godot",
+      "pattern_id": "project_godot"
+    }
+  ],
+  "combination_rules": [
+    {
+      "id": "validator.runtime-external-required.v1",
+      "version": "1.0.0",
+      "feature": "external_validator_required",
+      "minimum_tier": "L1_PLUS",
+      "requires_all": [
+        "runtime_behavior_change",
+        "external_validator_available"
+      ],
+      "pattern_id": "runtime_change_in_validated_stack"
+    }
+  ]
+}
