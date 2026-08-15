@@ -338,9 +338,14 @@ impl GooseAcpAgent {
             return Ok(());
         }
 
+        let mut recipe = recipe.clone();
+        if session.user_recipe_values.is_none() {
+            recipe.parameters = None;
+        }
+
         let recipe_dir = get_recipe_library_dir(true);
         if let Some(rendered) = self.render_recipe(
-            recipe,
+            &recipe,
             &recipe_dir,
             session.user_recipe_values.clone().unwrap_or_default(),
         )? {

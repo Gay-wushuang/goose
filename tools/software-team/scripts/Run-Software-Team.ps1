@@ -10,9 +10,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $supportRoot = Split-Path -Parent $PSScriptRoot
 $goose = Join-Path $supportRoot 'dist-windows\resources\bin\goose.exe'
-$recipe = Join-Path $supportRoot 'workflows\recipes\software-team.yaml'
 $shadowRouter = Join-Path $supportRoot 'workflows\scripts\Invoke-ShadowRouter.ps1'
 $auditWriter = Join-Path $supportRoot 'workflows\scripts\Write-WorkflowAudit.ps1'
+$modelSwitcher = Join-Path $supportRoot 'scripts\Switch-Local-Model.cmd'
 
 function Read-RequiredValue {
     param([string]$CurrentValue, [string]$Prompt)
@@ -24,6 +24,36 @@ function Read-RequiredValue {
 
 $Goal = Read-RequiredValue -CurrentValue $Goal -Prompt 'Task goal'
 $RepositoryPath = Read-RequiredValue -CurrentValue $RepositoryPath -Prompt 'Absolute repository path'
+
+if ($Tier -eq 'UNSPECIFIED') {
+    Write-Host ''
+    Write-Host 'Select the binding workflow entry:'
+    Write-Host '  0 - L0: mechanical/local E4B (Codex 0)'
+    Write-Host '  1 - L1: normal local A4B (Codex 0)'
+    Write-Host '  2 - L1+: local A4B with self-check and risk gate (Codex 0)'
+    Write-Host '  3 - L2: Codex architect + local worker + Codex review'
+    Write-Host '  4 - L3: Codex read-only diagnosis'
+    $selection = (Read-Host 'Entry [0-4]').Trim()
+    $Tier = switch ($selection) {
+        '0' { 'L0' }
+        '1' { 'L1' }
+        '2' { 'L1_PLUS' }
+        '3' { 'L2' }
+        '4' { 'L3' }
+        default { throw "Invalid entry selection: $selection" }
+    }
+}
+
+$route = switch ($Tier) {
+    'L0' { @{ Recipe = 'software-team-local-fast.yaml'; Model = 'e4b'; Role = 'fast-worker-e4b' } }
+    'L1' { @{ Recipe = 'software-team-local-primary.yaml'; Model = '26b'; Role = 'primary-worker-26b' } }
+    'L1_PLUS' { @{ Recipe = 'software-team-local-primary.yaml'; Model = '26b'; Role = 'primary-worker-26b-risk-gated' } }
+    'L2' { @{ Recipe = 'software-team.yaml'; Model = $null; Role = 'codex-architect-reviewer' } }
+    'L3' { @{ Recipe = 'software-team-diagnosis.yaml'; Model = $null; Role = 'codex-diagnostician' } }
+    default { throw "Unsupported binding tier: $Tier" }
+}
+if ($Role -eq 'UNSPECIFIED') { $Role = $route.Role }
+$recipe = Join-Path $supportRoot (Join-Path 'workflows\recipes' $route.Recipe)
 
 if ([string]::IsNullOrWhiteSpace($Goal) -or $Goal -eq '^') {
     throw 'Task goal is required. Do not pass a caret (^) as an argument.'
@@ -51,6 +81,8 @@ if ([string]::IsNullOrWhiteSpace($Constraints) -or $Constraints.Trim() -eq '^') 
 Write-Host "Goal: $Goal"
 Write-Host "Repository: $resolvedRepository"
 Write-Host "Constraints: $Constraints"
+Write-Host "Binding entry: $Tier / $Role"
+Write-Host "Recipe: $($route.Recipe)"
 
 if (-not (Test-Path -LiteralPath $shadowRouter -PathType Leaf)) {
     throw "Shadow Router does not exist: $shadowRouter"
@@ -72,12 +104,15 @@ $runManifest = [ordered]@{
     repository_path = $resolvedRepository
     goal = $Goal
     constraints = $Constraints
+    entry_tier = $Tier
+    entry_role = $Role
+    recipe = $route.Recipe
     audit_policy = 'APPEND_ONLY_READ_ONLY_ARTIFACTS'
 }
 & $auditWriter -RunDirectory $runDirectory -Artifact '00-run' -Json ($runManifest | ConvertTo-Json -Depth 10 -Compress) | Out-Null
 & $auditWriter -RunDirectory $runDirectory -Artifact '01-shadow-route' -Json $shadowJson | Out-Null
 Write-Host ''
-Write-Host 'Shadow Router (non-binding)'
+Write-Host 'Shadow Router recommendation (non-binding)'
 Write-Host "Human choice: $Tier / $Role"
 Write-Host "Recommendation: $($shadow.recommendation.tier)"
 if ($shadow.risk_features.Count -eq 0) {
@@ -94,11 +129,21 @@ if ($shadow.risk_features.Count -eq 0) {
             $feature.evidence.rule_version)
     }
 }
-Write-Host 'This recommendation does not change the selected workflow.'
+Write-Host "Binding route remains the human-selected $Tier entry."
 Write-Host "Workflow run ID: $runId"
 Write-Host "Audit directory: $runDirectory"
 
 $env:GOOSE_MAX_TOOL_REPETITIONS = '2'
+
+if (-not $RenderOnly -and $route.Model) {
+    if (-not (Test-Path -LiteralPath $modelSwitcher -PathType Leaf)) {
+        throw "Local model switcher does not exist: $modelSwitcher"
+    }
+    & $modelSwitcher $route.Model
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to start the local model for $Tier (exit code $LASTEXITCODE)."
+    }
+}
 
 $arguments = @(
     'run', '--recipe', $recipe,
@@ -107,6 +152,7 @@ $arguments = @(
     '--params', "constraints=$Constraints",
     '--params', "run_id=$runId",
     '--params', "audit_directory=$runDirectory",
+    '--params', "entry_tier=$Tier",
     '--max-tool-repetitions', '2'
 )
 if ($RenderOnly) {

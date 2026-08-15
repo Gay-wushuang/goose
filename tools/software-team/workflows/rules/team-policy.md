@@ -81,6 +81,16 @@ Baseline -> Architect/classify (`REVIEW_ONLY`, `SMALL`, or `LARGE`) -> approval 
 - Reject edits whose before and after content are identical with `NO_OP_EDIT`.
 - Stop a worker after two consecutive identical tool calls or two consecutive mutating calls that produce no filesystem-content change. Report `TOOL_LOOP_DETECTED` and preserve the current worktree.
 - After a mutation, reread the affected region or inspect the diff before issuing another mutation to the same target.
+- Treat `NO_OP_EDIT` as evidence that the proposed replacement creates no new
+  state. After the required read, do not retry that patch and do not disguise it
+  as a full-file write. Verify whether the intended state already exists; if it
+  does, continue to the missing acceptance criterion or validation. Otherwise
+  construct a materially different change.
+- Treat exact-match/state-mismatch as a patching-strategy failure. After one
+  failed exact edit, reread the target. For a file under 300 lines, prefer one
+  complete-file write based on the newly observed content instead of a second
+  fragile exact edit. For larger files, rebuild a different bounded patch or
+  escalate. Never repeat the failed request after an intervening read.
 - Runtime guard termination is `ABORTED`, not a semantic repair. Send the observed state to Codex to decide whether to resume, re-plan, or block.
 
 ## Stack-specific rules
@@ -98,3 +108,11 @@ Classification and rationale; changed files; acceptance criteria status; command
 - When usage metadata is available, store input, cached-input, output, and total tokens by role/provider/model. Mark unavailable fields `null`; never estimate them inside the audit record.
 - Do not store credentials, environment secrets, provider authentication, hidden reasoning, full provider prompts, unrelated source files, or unbounded command logs.
 - The audit trail is evidence, not authority: current repository state and rerun validators remain authoritative.
+
+## Codex context budget
+- Codex planning and review are diff-first and evidence-driven; never preload the whole repository.
+- Begin with instructions, goal/contract, status, diff stat/path list, bounded diff, and normalized validator evidence.
+- Architect may read target symbols before a task diff exists. Reviewer expands beyond the diff only to verify a named acceptance criterion or suspected finding.
+- Prefer symbol/range reads for files of 300 lines or more. Complete-file reads require a reason; unchanged-file reads always require a reason.
+- Persist every expansion beyond the initial target/diff set as `context_expansions` with path, range or symbol, and reason.
+- Truncate repetitive logs to the command, exit code, relevant error lines, and a bounded tail.

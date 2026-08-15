@@ -6,6 +6,7 @@ pub mod code_execution;
 pub mod developer;
 pub mod ext_manager;
 pub mod orchestrator;
+pub mod repository_reader;
 pub mod summarize;
 pub mod summon;
 pub mod todo;
@@ -158,6 +159,21 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 unprefixed_tools: true,
                 hidden: false,
                 client_factory: |ctx| Box::new(developer::DeveloperClient::new(ctx).unwrap()),
+            },
+        );
+
+        map.insert(
+            repository_reader::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: repository_reader::EXTENSION_NAME,
+                display_name: "Repository Reader",
+                description: "Read repository files, status, and diffs without mutation tools",
+                default_enabled: true,
+                unprefixed_tools: false,
+                hidden: false,
+                client_factory: |ctx| {
+                    Box::new(repository_reader::RepositoryReaderClient::new(ctx).unwrap())
+                },
             },
         );
 

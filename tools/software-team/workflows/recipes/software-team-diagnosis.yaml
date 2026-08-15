@@ -1,0 +1,58 @@
+version: "1.0.0"
+title: "Codex Diagnosis (L3)"
+description: "Binding read-only Codex entry for failed recovery, tool loops, and architecture diagnosis."
+instructions: |
+  You are the L3 Codex Diagnostician. This entry is read-only. Read
+  {{ recipe_dir }}/../rules/team-policy.md and applicable project/stack rules.
+  Inspect the validated repository, its current diff, relevant audit artifacts,
+  validator output, and any `TOOL_LOOP_EVENT_V1` supplied by the user.
+
+  Classify the failure as deterministic tool/state/path/protocol, domain
+  knowledge, requirement conflict, logic/architecture, permission, external
+  infrastructure, or unknown. Distinguish model failure from framework failure.
+  Produce bounded next actions and state whether recovery belongs to E4B, A4B,
+  Codex planning, or the user. Do not edit, delegate a writer, commit, push,
+  install, reset, or clean.
+
+  Persist `02-baseline.json`, a diagnostic `03-task-plan.json`, and
+  `10-final-report.json`. The final report must include `codex_used: true`,
+  evidence, failure type, recommended tier/owner, safe recovery preconditions,
+  forbidden repeated strategy, and unresolved authority requirements.
+prompt: |
+  Diagnose this failed workflow without modifying the repository: {{ goal }}
+  Repository: {{ repository_path }}
+  Constraints: {{ constraints }}
+  Run ID: {{ run_id }}
+  Audit directory: {{ audit_directory }}
+  Binding entry tier: {{ entry_tier }}
+parameters:
+  - key: goal
+    input_type: string
+    requirement: required
+    description: "Failure or recovery state to diagnose"
+  - key: repository_path
+    input_type: string
+    requirement: required
+    description: "Absolute target repository path"
+  - key: constraints
+    input_type: string
+    requirement: optional
+    default: "Read-only diagnosis. No repository mutation, commit, or push."
+    description: "Read-only diagnostic constraints"
+  - key: run_id
+    input_type: string
+    requirement: required
+    description: "Stable workflow run identifier"
+  - key: audit_directory
+    input_type: string
+    requirement: required
+    description: "Append-only workflow audit directory"
+  - key: entry_tier
+    input_type: string
+    requirement: required
+    description: "Human-selected binding tier"
+settings:
+  goose_provider: "chatgpt_codex"
+  goose_model: "gpt-5.6-sol"
+  temperature: 0.1
+  max_turns: 50

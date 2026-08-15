@@ -76,8 +76,8 @@ A4B → Preflight → Validator → DONE/ESCALATE
 - 单文件业务逻辑。
 - 范围清楚的 UI 修改。
 
-Codex 目标消耗：0 token，但当前生产 Recipe 仍会先调用 Architect 分类；要实现严格的
-Codex 0 token 入口，需要以后增加独立的 L0/L1 Recipe。
+Codex 目标消耗：0 token。当前 L1 使用独立的本地 A4B Recipe，不会先调用 Codex
+Architect；遇到无法确定的问题只会建议升级，不会静默调用 Codex。
 
 ### L1+：存在不确定性
 
@@ -152,6 +152,16 @@ E:\Goose-win32-x64\Run-Software-Team.cmd "给现有 Godot C# 贪吃蛇增加暂�
 参数 3：constraints
 ```
 
+双击或未传 `-Tier` 时，脚本会要求选择一个真正绑定的入口：
+
+```text
+0 - L0：E4B 机械任务，Codex 0
+1 - L1：A4B 普通开发，Codex 0
+2 - L1+：A4B + Self Check/Risk Gate，Codex 0
+3 - L2：Codex Architect + 本地 Worker + Codex Review
+4 - L3：Codex 只读故障诊断
+```
+
 如果漏填前两个参数，脚本会交互询问。
 
 不要这样调用：
@@ -164,10 +174,10 @@ Run-Software-Team.cmd ^
 
 行尾空格、PowerShell 粘贴或终端转义可能把 `^` 当作真实参数。
 
-## 6. 人工记录入口层级
+## 6. 人工绑定入口层级
 
-Shadow Router 当前只记录风险与建议，不会自动改变执行路径。要记录你的人工选择，直接调用
-PowerShell 入口：
+人工 `Tier` 现在决定实际 Recipe 和初始 Provider。Shadow Router 仍只提供非绑定建议，
+不会覆盖你的人工选择。可以在命令行直接指定入口：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
@@ -185,8 +195,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 UNSPECIFIED, L0, L1, L1_PLUS, L2, L3
 ```
 
-这里的 `Tier` 和 `Role` 是观察数据，不是强制路由命令。这样可以积累真实任务与人工判断，
-以后再制定自动路由规则，避免现在过早分类造成误导。
+`Tier` 是绑定路由；`Role` 主要用于审计记录，省略时由入口自动填写。Shadow Recommendation
+继续作为观察数据，供以后制定自动路由规则。
 
 ## 7. 一次完整运行会发生什么
 
@@ -399,6 +409,14 @@ Get-ChildItem E:\Goose-win32-x64\logs\workflow-runs\<run_id> |
 新合同链通过只传必要事实和稳定 ID，目标是减少重复上下文。根据已有 85 消息 A4B
 对话的真实累计 `204,516 tokens`，同等任务的合理目标约为 `80K–135K`，即本地模型累计
 Token 可能下降约 `35%–65%`。这只是初始估计，不是保证值。
+
+Codex 采用 diff-first 读取策略：先读取项目规则、合同、`git status --short`、diff stat、
+改动路径、有限 diff 和 Validator 摘要。只有为了验证具体 `AC-*` 或潜在 `F-*` 时才扩展到
+函数、调用者、接口、测试或配置。300 行以上文件优先读取符号或范围；完整文件和未修改文件
+必须记录读取理由。扩展记录保存在审计工件的 `context_expansions` 中。
+
+这不是绝对“只读 diff”：Architect 在尚无本轮 diff 时仍需读取目标符号；Reviewer 在 diff
+无法证明运行时或接口行为时也可以按证据扩展。禁止的是无理由读取整个仓库和完整重复日志。
 
 `10-final-report.json` 会在 Provider 提供 usage 时记录：
 

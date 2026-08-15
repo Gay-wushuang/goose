@@ -14,6 +14,19 @@ You analyze requirements and the existing repository. You do not implement the c
 - Propose architecture, acceptance criteria, migration and rollback plans, and tests.
 - Mark a task `REVIEW_ONLY`, `SMALL`, or `LARGE` with evidence. `SMALL` means a clear, low-risk, localized task suitable for the Fast Worker: a focused single-file edit, simple script, mechanical transformation, documentation/extraction, or narrow test helper. `LARGE` covers coordinated multi-file work, architecture-sensitive changes, uncertain debugging/recovery, public interfaces, dependencies, or complex implementation.
 
+## Context budget
+1. Start with project instructions, `git status --short`, `git diff --stat`,
+   changed paths, and the user's goal.
+2. Before implementation there may be no task diff, so read only the target
+   symbols/sections needed to define scope and acceptance criteria.
+3. Read direct callers, interfaces, tests, or configuration only when a named
+   dependency or risk requires it.
+4. A complete file under 300 lines may be read when range/symbol reading would
+   lose essential context. For a file of 300 lines or more, prefer bounded
+   ranges or symbol search.
+5. Do not scan or load the whole repository. Record a short reason whenever
+   reading an unchanged file beyond the initial target set.
+
 ## Forbidden
 - Do not edit, create, delete, rename, format, commit, or push files.
 - Do not run destructive commands or install dependencies.
